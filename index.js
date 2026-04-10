@@ -2,7 +2,8 @@ import {
     default as makeWASocket, 
     useMultiFileAuthState, 
     DisconnectReason,
-    Browsers
+    Browsers,
+    fetchLatestBaileysVersion
 } from 'baileys';
 import pino from 'pino';
 import TelegramBot from 'node-telegram-bot-api';
@@ -34,10 +35,14 @@ async function startWA(phoneNumberForPairing = null) {
     isConnecting = true;
 
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    
+    // Ambil versi WA Web terbaru secara dinamis agar tidak ditolak server (Anti Connection Closed)
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`Menggunakan WA v${version.join('.')}, isLatest: ${isLatest}`);
 
     // Konfigurasi Baileys v7 yang aman untuk Pairing Code
     sock = makeWASocket({
-        version: [2, 3000, 1015901307],
+        version, 
         printQRInTerminal: false,
         browser: Browsers.macOS('Chrome'), // Standar browser wajib dari baileys.wiki
         auth: state,
@@ -50,15 +55,16 @@ async function startWA(phoneNumberForPairing = null) {
     if (phoneNumberForPairing && !sock.authState.creds.registered) {
         teleBot.sendMessage(TELEGRAM_CHAT_ID, `⏳ *Menghubungkan ke server Meta...*\nMeminta kode untuk nomor: \`${phoneNumberForPairing}\``, { parse_mode: 'Markdown' });
         
-        // Delay 3 detik agar socket benar-benar terbuka (mencegah error Precondition Required)
+        // Perpanjang jeda menjadi 6 detik untuk memastikan koneksi WebSocket stabil
         setTimeout(async () => {
             try {
                 const code = await sock.requestPairingCode(phoneNumberForPairing);
                 teleBot.sendMessage(TELEGRAM_CHAT_ID, `✅ *KODE PAIRING ANDA:* \`${code}\`\n\n1️⃣ Buka WhatsApp Bot\n2️⃣ Titik tiga (Kanan Atas) -> *Linked Devices*\n3️⃣ *Link with phone number instead*\n4️⃣ Masukkan kode di atas secara hati-hati.`, { parse_mode: 'Markdown' });
             } catch (error) {
-                teleBot.sendMessage(TELEGRAM_CHAT_ID, `❌ *Gagal request kode:* ${error.message}\nPastikan format nomor benar (628xxx) dan belum kena limit cooldown.`, { parse_mode: 'Markdown' });
+                teleBot.sendMessage(TELEGRAM_CHAT_ID, `❌ *Gagal request kode:* ${error.message}\nPastikan nomor benar dan Anda sudah menghapus folder auth_info_baileys jika ini adalah percobaan ulang.`, { parse_mode: 'Markdown' });
+                isConnecting = false;
             }
-        }, 3000); 
+        }, 6000); 
     }
 
     // Auto-Reconnect & Connection State Logic
