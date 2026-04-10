@@ -1,11 +1,12 @@
 import { 
     default as makeWASocket, 
     useMultiFileAuthState, 
-    DisconnectReason 
+    DisconnectReason,
+    Browsers
 } from 'baileys';
 import pino from 'pino';
-import readline from 'readline';
 import TelegramBot from 'node-telegram-bot-api';
+import fs from 'fs';
 
 // === KONFIGURASI ===
 const TELEGRAM_BOT_TOKEN = 'TOKEN_BOT_TELEGRAM_KAMU';
@@ -21,15 +22,50 @@ const SPEED_MODES = {
 
 // Memory untuk antrean file
 const jobQueue = new Map();
-
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-// === TELEGRAM HANDLER ===
+let sock; // Global socket
+
+// === TELEGRAM COMMANDS (KONTROL WHATSAPP) ===
+
+// 1. Command untuk Login via Pairing Code
+teleBot.onText(/\/login (\d+)/, async (msg, match) => {
+    if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
+    
+    const phoneNumber = match[1];
+
+    if (sock?.authState?.creds?.registered) {
+        return teleBot.sendMessage(msg.chat.id, '❌ Bot WhatsApp sudah dalam keadaan login dan siap digunakan.');
+    }
+
+    teleBot.sendMessage(msg.chat.id, `⏳ *Meminta Pairing Code untuk nomor:* \`${phoneNumber}\`...`, { parse_mode: 'Markdown' });
+
+    try {
+        // Beri jeda sedikit agar socket benar-benar stabil sebelum request
+        await delay(1500); 
+        const code = await sock.requestPairingCode(phoneNumber);
+        
+        teleBot.sendMessage(msg.chat.id, `✅ *KODE PAIRING ANDA:* \`${code}\`\n\nBuka WhatsApp target -> Titik tiga (Kanan Atas) -> *Linked Devices* -> *Link with phone number instead*.\n\n_Masukkan kode di atas._`, { parse_mode: 'Markdown' });
+    } catch (error) {
+        teleBot.sendMessage(msg.chat.id, `❌ *Gagal mendapatkan kode:*\n${error.message}`, { parse_mode: 'Markdown' });
+    }
+});
+
+// 2. Command Cek Status
+teleBot.onText(/\/status/, (msg) => {
+    if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
+    const isRegistered = sock?.authState?.creds?.registered ? "✅ LOGIN" : "❌ BELUM LOGIN";
+    teleBot.sendMessage(msg.chat.id, `*Status WhatsApp Bot:*\n${isRegistered}\n\n_Jika belum login, gunakan perintah:_ \n\`/login 628xxx\``, { parse_mode: 'Markdown' });
+});
+
+// === TELEGRAM HANDLER (BULK CHECKER) ===
 
 teleBot.on('document', async (msg) => {
     if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
+
+    if (!sock?.authState?.creds?.registered) {
+        return teleBot.sendMessage(msg.chat.id, '⚠️ *WhatsApp belum login!* Ketik `/login 628xxx` terlebih dahulu sebelum mengunggah file.', { parse_mode: 'Markdown' });
+    }
 
     const fileId = msg.document.file_id;
     const fileName = msg.document.file_name;
@@ -43,7 +79,6 @@ teleBot.on('document', async (msg) => {
         const response = await fetch(fileLink);
         const textData = await response.text();
 
-        // Bersihkan dan format nomor
         let rawNumbers = textData.split('\n').map(n => n.replace(/\D/g, '')).filter(n => n.length > 8);
         const formattedNumbers = rawNumbers.map(n => {
             if (n.startsWith('0')) return '62' + n.slice(1);
@@ -78,7 +113,6 @@ teleBot.on('document', async (msg) => {
 });
 
 // === WHATSAPP BOT ENGINE ===
-let sock; 
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -86,25 +120,28 @@ async function startBot() {
     sock = makeWASocket({
         version: [2, 3000, 1015901307],
         printQRInTerminal: false,
+        browser: Browsers.macOS('Chrome'), // Tambahan agar server WA merespon pairing lebih baik
         auth: state,
         logger: pino({ level: 'silent' }) 
     });
 
+    // Peringatan otomatis ke Telegram jika script jalan tapi WA belum login
     if (!sock.authState.creds.registered) {
-        console.log('--- LOGIN VIA PAIRING CODE ---');
-        const phoneNumber = await question('Masukkan nomor WhatsApp Bot (628...): ');
-        const code = await sock.requestPairingCode(phoneNumber.trim());
-        console.log(`\n> KODE PAIRING: ${code}\n`);
+        teleBot.sendMessage(TELEGRAM_CHAT_ID, "⚠️ *WhatsApp Belum Terhubung!*\n\nSilakan balas pesan ini dengan format:\n`/login 628xxxxxxxx`\nUntuk mendapatkan Pairing Code.", { parse_mode: 'Markdown' });
     }
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) startBot();
+            if (shouldReconnect) {
+                startBot();
+            } else {
+                teleBot.sendMessage(TELEGRAM_CHAT_ID, "❌ *WhatsApp ter-Logout!* Sesi dihapus. Silakan hapus folder 'auth_info_baileys' dan restart script.");
+            }
         } else if (connection === 'open') {
-            console.log('✅ WA Bot Ready for Bulk Check!');
-            teleBot.sendMessage(TELEGRAM_CHAT_ID, '✅ Mesin WhatsApp siap digunakan untuk Bulk Check.');
+            console.log('✅ WA Bot Ready!');
+            teleBot.sendMessage(TELEGRAM_CHAT_ID, '✅ *WhatsApp berhasil terhubung!* Mesin siap digunakan untuk Bulk Check.', { parse_mode: 'Markdown' });
         }
     });
 
@@ -161,18 +198,15 @@ async function processBulkCheck(numbers, config, chatId, msgId) {
             let bizCategory = 'Tidak diketahui';
 
             try {
-                // 1. Cek apakah nomor aktif di WA
                 const [result] = await sock.onWhatsApp(jid);
                 isRegistered = result?.exists || false;
 
                 if (isRegistered) {
-                    // 2. Cek Bio/Status Umum
                     try {
                         const statusData = await sock.fetchStatus(jid);
                         bio = statusData?.status || bio;
                     } catch (e) {} 
 
-                    // 3. Cek Profil Bisnis
                     try {
                         const bizProfile = await sock.getBusinessProfile(jid);
                         if (bizProfile) {
@@ -180,9 +214,7 @@ async function processBulkCheck(numbers, config, chatId, msgId) {
                             bizDesc = bizProfile.description || bizDesc;
                             bizCategory = bizProfile.category || bizCategory;
                         }
-                    } catch (e) {
-                        // Jika error, berarti nomor personal biasa (bukan bisnis)
-                    }
+                    } catch (e) {}
                 }
             } catch (error) {}
 
@@ -212,7 +244,7 @@ async function processBulkCheck(numbers, config, chatId, msgId) {
 
         processed += batchNumbers.length;
 
-        teleBot.editMessageText(`⏳ *Proses Berjalan...*\nProgress: ${processed} / ${total}\n_Menunggu delay ${config.delay/1000} detik sebelum batch selanjutnya..._`, {
+        teleBot.editMessageText(`⏳ *Proses Berjalan...*\nProgress: ${processed} / ${total}\n_Menunggu delay ${config.delay/1000} detik..._`, {
             chat_id: chatId,
             message_id: msgId,
             parse_mode: 'Markdown'
@@ -221,35 +253,20 @@ async function processBulkCheck(numbers, config, chatId, msgId) {
         if (processed < total) await delay(config.delay);
     }
 
-    // Selesai
     teleBot.editMessageText(`✅ *Proses Selesai!*\n\n📊 *Statistik:*\nTotal Dicek: ${total}\n👤 WA Personal: ${countPersonal}\n🏢 WA Bisnis: ${countBisnis}\n❌ Tidak Terdaftar: ${countTidakTerdaftar}`, {
         chat_id: chatId,
         message_id: msgId,
         parse_mode: 'Markdown'
     });
 
-    // Kirim File Personal (Full Info)
     if (countPersonal > 0) {
-        teleBot.sendDocument(chatId, Buffer.from(resultPersonal, 'utf-8'), {}, {
-            filename: `WA_Personal_Terdaftar_${Date.now()}.txt`,
-            contentType: 'text/plain'
-        });
+        teleBot.sendDocument(chatId, Buffer.from(resultPersonal, 'utf-8'), {}, { filename: `WA_Personal_${Date.now()}.txt`, contentType: 'text/plain' });
     }
-
-    // Kirim File Bisnis (Full Info Tambahan)
     if (countBisnis > 0) {
-        teleBot.sendDocument(chatId, Buffer.from(resultBisnis, 'utf-8'), {}, {
-            filename: `WA_Bisnis_Terdaftar_${Date.now()}.txt`,
-            contentType: 'text/plain'
-        });
+        teleBot.sendDocument(chatId, Buffer.from(resultBisnis, 'utf-8'), {}, { filename: `WA_Bisnis_${Date.now()}.txt`, contentType: 'text/plain' });
     }
-
-    // Kirim File Tidak Terdaftar (Hanya Nomor)
     if (countTidakTerdaftar > 0) {
-        teleBot.sendDocument(chatId, Buffer.from(resultTidakTerdaftar, 'utf-8'), {}, {
-            filename: `Tidak_Terdaftar_${Date.now()}.txt`,
-            contentType: 'text/plain'
-        });
+        teleBot.sendDocument(chatId, Buffer.from(resultTidakTerdaftar, 'utf-8'), {}, { filename: `Tidak_Terdaftar_${Date.now()}.txt`, contentType: 'text/plain' });
     }
 }
 
