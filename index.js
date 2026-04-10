@@ -1,29 +1,30 @@
 import { 
     default as makeWASocket, 
     useMultiFileAuthState, 
-    DisconnectReason,
-    Browsers
+    DisconnectReason 
 } from 'baileys';
 import pino from 'pino';
 import TelegramBot from 'node-telegram-bot-api';
 import fs from 'fs';
 
-// === KONFIGURASI ===
+// === KONFIGURASI BOT ===
 const TELEGRAM_BOT_TOKEN = 'TOKEN_BOT_TELEGRAM_KAMU';
 const TELEGRAM_CHAT_ID = 'ID_CHAT_ADMIN_TELEGRAM_KAMU'; 
 const teleBot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
+// Konfigurasi Kecepatan (Batch Size & Delay dalam milidetik)
 const SPEED_MODES = {
     fast: { batch: 100, delay: 3000 },
     normal: { batch: 50, delay: 5000 },
     slow: { batch: 20, delay: 10000 }
 };
 
+// Memory sementara untuk antrean file bulk
 const jobQueue = new Map();
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-let sock; // Global socket
-let isConnecting = false; // Mencegah spam koneksi
+let sock; 
+let isConnecting = false; 
 
 // === FUNGSI START WHATSAPP ===
 async function startWA(phoneNumberForPairing = null) {
@@ -35,28 +36,29 @@ async function startWA(phoneNumberForPairing = null) {
     sock = makeWASocket({
         version: [2, 3000, 1015901307],
         printQRInTerminal: false,
-        browser: Browsers.macOS('Chrome'),
+        // Konfigurasi Browser Array untuk Bypass Blokir Perangkat
+        browser: ['Ubuntu', 'Chrome', '20.0.04'], 
         auth: state,
         logger: pino({ level: 'silent' }) 
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Jika ada nomor yang dilempar untuk pairing & belum terdaftar
+    // Proses Request Pairing Code
     if (phoneNumberForPairing && !sock.authState.creds.registered) {
         teleBot.sendMessage(TELEGRAM_CHAT_ID, `⏳ *Menghubungkan ke WA & Meminta Kode...*`, { parse_mode: 'Markdown' });
         
-        // Jeda agar socket terbuka sempurna sebelum request kode
         setTimeout(async () => {
             try {
                 const code = await sock.requestPairingCode(phoneNumberForPairing);
                 teleBot.sendMessage(TELEGRAM_CHAT_ID, `✅ *KODE PAIRING ANDA:* \`${code}\`\n\n1️⃣ Buka WhatsApp Bot\n2️⃣ Titik tiga (Kanan Atas) -> *Linked Devices*\n3️⃣ *Link with phone number instead*\n4️⃣ Masukkan kode di atas.`, { parse_mode: 'Markdown' });
             } catch (error) {
-                teleBot.sendMessage(TELEGRAM_CHAT_ID, `❌ *Gagal request kode:* ${error.message}\nPastikan format nomor benar (628xxx).`, { parse_mode: 'Markdown' });
+                teleBot.sendMessage(TELEGRAM_CHAT_ID, `❌ *Gagal request kode:* ${error.message}\nPastikan format nomor benar (628xxx) dan belum kena limit cooldown.`, { parse_mode: 'Markdown' });
             }
         }, 2500); 
     }
 
+    // Auto-Reconnect & Connection State Logic
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
         
@@ -67,13 +69,12 @@ async function startWA(phoneNumberForPairing = null) {
             
             if (shouldReconnect) {
                 console.log('Koneksi terputus. Auto-reconnecting dalam 5 detik...');
-                setTimeout(() => startWA(), 5000); // Delay 5 detik untuk auto-reconnect (anti-spam)
+                setTimeout(() => startWA(), 5000); 
             } else {
                 teleBot.sendMessage(TELEGRAM_CHAT_ID, "❌ *WhatsApp Logout/Dikeluarkan!*\nSesi telah dihapus. Silakan klik tombol Login WA lagi untuk menghubungkan ulang.", { parse_mode: 'Markdown' });
-                // Hapus folder auth agar bersih
                 fs.rmSync('./auth_info_baileys', { recursive: true, force: true });
                 sock = null;
-                showTelegramMenu(); // Tampilkan menu login
+                showTelegramMenu(); 
             }
         } else if (connection === 'open') {
             isConnecting = false;
@@ -104,57 +105,50 @@ function showTelegramMenu() {
 
 // === TELEGRAM HANDLER ===
 
-// 1. Inisialisasi Saat Script Dijalankan
 console.log('Script Node.js berjalan. Mengecek status database...');
 if (fs.existsSync('./auth_info_baileys/creds.json')) {
     console.log('Ditemukan sesi lama. Mencoba auto-connect...');
-    startWA(); // Auto connect jika sudah pernah login
+    startWA(); 
 } else {
     console.log('Menunggu instruksi koneksi dari Telegram...');
-    showTelegramMenu(); // Minta user klik tombol dari Telegram
+    showTelegramMenu(); 
 }
 
-// 2. Command Menu Standar
 teleBot.onText(/\/(start|menu)/, (msg) => {
     if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
     showTelegramMenu();
 });
 
-// 3. Tangkap Balasan (Force Reply) untuk Nomor Telepon
+// Listener untuk memproses nomor telepon yang dibalas via Telegram
 teleBot.on('message', (msg) => {
     if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
     
-    // Jika pesan ini adalah balasan dari bot yang meminta nomor WA
     if (msg.reply_to_message && msg.reply_to_message.text.includes("Balas pesan ini dengan nomor WhatsApp")) {
-        const phoneNumber = msg.text.replace(/\D/g, ''); // Ambil angkanya saja
+        const phoneNumber = msg.text.replace(/\D/g, ''); 
         if (phoneNumber.length < 9 || !phoneNumber.startsWith('62')) {
             return teleBot.sendMessage(TELEGRAM_CHAT_ID, "❌ *Format nomor salah!* Harus diawali dengan 62 (contoh: 6281234...). Silakan ulangi tekan tombol Login.");
         }
-        
-        startWA(phoneNumber); // Jalankan WhatsApp dengan nomor ini
+        startWA(phoneNumber); 
     }
 });
 
-// 4. Callback Query (Tombol Ditekan)
+// Listener interaksi tombol Inline Keyboard
 teleBot.on('callback_query', async (callbackQuery) => {
     const message = callbackQuery.message;
     const data = callbackQuery.data;
 
-    // Aksi Tombol Login
     if (data === 'action_login_wa') {
         if (fs.existsSync('./auth_info_baileys/creds.json')) {
             return teleBot.answerCallbackQuery(callbackQuery.id, { text: 'WhatsApp sudah terhubung!', show_alert: true });
         }
         
-        // Minta user membalas pesan ini dengan nomor WA
         teleBot.sendMessage(message.chat.id, "📱 *Masukkan Nomor WhatsApp*\n\nBalas pesan ini dengan nomor WhatsApp Bot yang ingin disambungkan.\n(Gunakan format *628xxx* tanpa spasi/tanda plus)", {
             parse_mode: 'Markdown',
-            reply_markup: { force_reply: true } // Memaksa user untuk me-reply
+            reply_markup: { force_reply: true } 
         });
         teleBot.answerCallbackQuery(callbackQuery.id);
     }
 
-    // Aksi Tombol Bulk (Mulai Cek Kecepatan)
     else if (data.startsWith('start_')) {
         const [, jobId, mode] = data.split('_');
         const numbersList = jobQueue.get(jobId);
@@ -175,7 +169,7 @@ teleBot.on('callback_query', async (callbackQuery) => {
     }
 });
 
-// 5. Handle File TXT (Upload Target Bulk)
+// Listener untuk menerima file .txt target Bulk
 teleBot.on('document', async (msg) => {
     if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
 
@@ -308,6 +302,7 @@ async function processBulkCheck(numbers, config, chatId, msgId) {
         if (processed < total) await delay(config.delay);
     }
 
+    // Eksekusi Pengiriman File ke Telegram
     teleBot.editMessageText(`✅ *Proses Selesai!*\n\n📊 *Statistik:*\nTotal Dicek: ${total}\n👤 WA Personal: ${countPersonal}\n🏢 WA Bisnis: ${countBisnis}\n❌ Tidak Terdaftar: ${countTidakTerdaftar}`, {
         chat_id: chatId,
         message_id: msgId,
