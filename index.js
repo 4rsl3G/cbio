@@ -10,7 +10,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import fs from 'fs';
 
 // === KONFIGURASI BOT ===
-// Ganti dengan Token Bot dan ID Chat Admin Telegram kamu
+// Ganti dengan Token Bot dan ID Chat Telegram
 const TELEGRAM_BOT_TOKEN = 'TOKEN_BOT_TELEGRAM_KAMU';
 const TELEGRAM_CHAT_ID = 'ID_CHAT_ADMIN_TELEGRAM_KAMU'; 
 const teleBot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
@@ -22,7 +22,6 @@ const SPEED_MODES = {
     slow: { batch: 20, delay: 10000 }
 };
 
-// Memory sementara untuk antrean file bulk
 const jobQueue = new Map();
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -36,26 +35,24 @@ async function startWA(phoneNumberForPairing = null) {
 
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     
-    // Ambil versi WA Web terbaru secara dinamis agar tidak ditolak server (Anti Connection Closed)
+    // Ambil versi WA Web terbaru (Anti Connection Closed)
     const { version, isLatest } = await fetchLatestBaileysVersion();
     console.log(`Menggunakan WA v${version.join('.')}, isLatest: ${isLatest}`);
 
-    // Konfigurasi Baileys v7 yang aman untuk Pairing Code
+    // Konfigurasi Baileys v7
     sock = makeWASocket({
         version, 
         printQRInTerminal: false,
-        browser: Browsers.macOS('Chrome'), // Standar browser wajib dari baileys.wiki
+        browser: Browsers.macOS('Chrome'),
         auth: state,
         logger: pino({ level: 'silent' }) 
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Proses Request Pairing Code
     if (phoneNumberForPairing && !sock.authState.creds.registered) {
         teleBot.sendMessage(TELEGRAM_CHAT_ID, `⏳ *Menghubungkan ke server Meta...*\nMeminta kode untuk nomor: \`${phoneNumberForPairing}\``, { parse_mode: 'Markdown' });
         
-        // Perpanjang jeda menjadi 6 detik untuk memastikan koneksi WebSocket stabil
         setTimeout(async () => {
             try {
                 const code = await sock.requestPairingCode(phoneNumberForPairing);
@@ -81,7 +78,6 @@ async function startWA(phoneNumberForPairing = null) {
                 setTimeout(() => startWA(), 5000); 
             } else {
                 teleBot.sendMessage(TELEGRAM_CHAT_ID, "❌ *WhatsApp Logout/Dikeluarkan dari Perangkat!*\nSesi telah dihapus secara otomatis. Silakan klik tombol Login WA untuk menghubungkan ulang.", { parse_mode: 'Markdown' });
-                // Bersihkan sesi korup otomatis
                 if (fs.existsSync('./auth_info_baileys')) {
                     fs.rmSync('./auth_info_baileys', { recursive: true, force: true });
                 }
