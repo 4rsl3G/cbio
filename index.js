@@ -13,25 +13,23 @@ const TELEGRAM_BOT_TOKEN = 'TOKEN_BOT_TELEGRAM_KAMU';
 const TELEGRAM_CHAT_ID = 'ID_CHAT_ADMIN_TELEGRAM_KAMU'; 
 const teleBot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
-// Sedikit penyesuaian delay untuk menjaga nomor agar tidak kena rate-limit Meta
-const SPEED_MODES = {
-    fast: { batch: 50, delay: 5000 },   // Diperkecil agar lebih aman
-    normal: { batch: 25, delay: 7000 },
-    slow: { batch: 10, delay: 10000 }
+// --- STATE MANAGEMENT & CONFIG ---
+const botState = {
+    isConnecting: false,
+    waitingForInput: false,
+    jobQueue: new Map(),
+    config: { batch: 25, delay: 7000 }
 };
 
-const jobQueue = new Map();
+let sock; 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-let sock; 
-let isConnecting = false; 
-
-async function startWA(phoneNumberForPairing = null) {
-    if (isConnecting) return;
-    isConnecting = true;
+// --- CORE WHATSAPP LOGIC ---
+async function startWA(phoneNumberForPairing = null, chatId = null, messageId = null) {
+    if (botState.isConnecting) return;
+    botState.isConnecting = true;
 
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-    
     const { version, isLatest } = await fetchLatestBaileysVersion();
     console.log(`Menggunakan WA v${version.join('.')}, isLatest: ${isLatest}`);
 
@@ -41,197 +39,271 @@ async function startWA(phoneNumberForPairing = null) {
         browser: Browsers.macOS('Chrome'),
         auth: state,
         logger: pino({ level: 'silent' }),
-        markOnlineOnConnect: false, // Menghindari spam presence
+        markOnlineOnConnect: false,
         generateHighQualityLinkPreview: true
     });
 
     sock.ev.on('creds.update', saveCreds);
 
+    // Request Pairing Code
     if (phoneNumberForPairing && !sock.authState.creds.registered) {
-        teleBot.sendMessage(TELEGRAM_CHAT_ID, `⏳ *Menghubungkan ke server Meta...*\nMeminta kode untuk nomor: \`${phoneNumberForPairing}\``, { parse_mode: 'Markdown' });
+        await editOrSendMessage(chatId, messageId, `⏳ *Menghubungkan ke server Meta...*\nMeminta kode untuk nomor: \`${phoneNumberForPairing}\``);
         
-        // Memberi waktu socket untuk inisialisasi sebelum request kode (mencegah spam/error)
         setTimeout(async () => {
             try {
                 const code = await sock.requestPairingCode(phoneNumberForPairing);
-                // Format kode agar lebih mudah dibaca (contoh: 1234-5678)
                 const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
-                teleBot.sendMessage(TELEGRAM_CHAT_ID, `✅ *KODE PAIRING ANDA:* \`${formattedCode}\`\n\n1️⃣ Buka WhatsApp di HP\n2️⃣ Titik tiga (Kanan Atas) -> *Linked Devices*\n3️⃣ *Link with phone number instead*\n4️⃣ Masukkan kode di atas secara hati-hati.`, { parse_mode: 'Markdown' });
+                
+                await editOrSendMessage(chatId, messageId, 
+                    `✅ *KODE PAIRING ANDA:* \`${formattedCode}\`\n\n` +
+                    `1️⃣ Buka WhatsApp di HP Anda\n` +
+                    `2️⃣ Buka *Linked Devices* (Perangkat Tertaut)\n` +
+                    `3️⃣ Pilih *Link with phone number instead*\n` +
+                    `4️⃣ Masukkan kode di atas.\n\n` +
+                    `_Sistem akan otomatis mendeteksi jika koneksi berhasil._`
+                );
             } catch (error) {
-                teleBot.sendMessage(TELEGRAM_CHAT_ID, `❌ *Gagal request kode:* ${error.message}\nPastikan nomor benar, tidak terkena limit Meta, dan hapus folder auth_info_baileys untuk mencoba ulang.`, { parse_mode: 'Markdown' });
-                isConnecting = false;
+                botState.isConnecting = false;
+                await editOrSendMessage(chatId, messageId, `❌ *Gagal request kode!*\nPastikan nomor benar dan tidak terkena rate-limit Meta.\nError: ${error.message}`, getBackKeyboard());
             }
         }, 4000); 
     }
 
-    sock.ev.on('connection.update', (update) => {
+    // Connection Events
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
         
         if (connection === 'close') {
-            isConnecting = false;
+            botState.isConnecting = false;
             const statusCode = lastDisconnect.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
             if (shouldReconnect) {
-                console.log(`Koneksi terputus (Status: ${statusCode}). Auto-reconnecting dalam 5 detik...`);
+                console.log(`[!] Auto-Reconnect: Koneksi terputus (Status: ${statusCode}). Menyambungkan kembali dalam 5 detik...`);
                 setTimeout(() => startWA(), 5000); 
             } else {
-                teleBot.sendMessage(TELEGRAM_CHAT_ID, "❌ *WhatsApp Logout/Dikeluarkan dari Perangkat!*\nSesi telah dihapus secara otomatis. Silakan klik tombol Login WA untuk menghubungkan ulang.", { parse_mode: 'Markdown' });
                 if (fs.existsSync('./auth_info_baileys')) {
                     fs.rmSync('./auth_info_baileys', { recursive: true, force: true });
                 }
                 sock = null;
-                showTelegramMenu(); 
+                teleBot.sendMessage(TELEGRAM_CHAT_ID, "⚠️ *Koneksi WhatsApp Dikeluarkan!*\nSesi telah dihapus otomatis. Silakan login kembali melalui Dashboard.", { parse_mode: 'Markdown' });
+                sendDashboard(TELEGRAM_CHAT_ID); 
             }
         } else if (connection === 'open') {
-            isConnecting = false;
+            botState.isConnecting = false;
             console.log('✅ WA Bot Ready!');
-            teleBot.sendMessage(TELEGRAM_CHAT_ID, '✅ *WhatsApp Berhasil Terhubung!*\nMesin siap digunakan untuk pengecekan data massal.', { parse_mode: 'Markdown' });
+            if (chatId) {
+                await sendDashboard(chatId, messageId);
+            } else {
+                teleBot.sendMessage(TELEGRAM_CHAT_ID, "✅ *WhatsApp Reconnected Successfully!*", { parse_mode: 'Markdown' });
+            }
         }
     });
 }
 
-function showTelegramMenu() {
-    const isRegistered = fs.existsSync('./auth_info_baileys/creds.json');
-    
-    if (isRegistered) {
-        teleBot.sendMessage(TELEGRAM_CHAT_ID, "✅ *Status: WhatsApp Terhubung!*\n\nSilakan kirim dokumen `.txt` berisi daftar nomor target (satu nomor per baris) ke chat ini untuk memulai pengecekan.", { parse_mode: 'Markdown' });
-    } else {
-        const keyboard = {
-            inline_keyboard: [
-                [{ text: '🔑 Login WhatsApp (Pairing Code)', callback_data: 'action_login_wa' }]
-            ]
-        };
-        teleBot.sendMessage(TELEGRAM_CHAT_ID, "⚠️ *Status: WhatsApp Belum Terhubung.*\n\nKlik tombol di bawah ini untuk menghubungkan bot WhatsApp Anda:", { 
-            parse_mode: 'Markdown',
-            reply_markup: keyboard
-        });
-    }
+// --- TELEGRAM UI & DASHBOARD ---
+async function editOrSendMessage(chatId, messageId, text, replyMarkup = null) {
+    const opts = { parse_mode: 'Markdown' };
+    if (replyMarkup) opts.reply_markup = replyMarkup;
+
+    try {
+        if (messageId) {
+            await teleBot.editMessageText(text, { chat_id: chatId, message_id: messageId, ...opts });
+        } else {
+            await teleBot.sendMessage(chatId, text, opts);
+        }
+    } catch (e) { /* Ignore identical edit error */ }
 }
 
-console.log('Bot Telegram Aktif. Mengecek database WhatsApp...');
+function getBackKeyboard() {
+    return { inline_keyboard: [[{ text: '🔙 Kembali ke Dashboard', callback_data: 'nav_dashboard' }]] };
+}
+
+async function sendDashboard(chatId, messageId = null) {
+    const isRegistered = fs.existsSync('./auth_info_baileys/creds.json');
+    const statusIcon = isRegistered ? '🟢 TERHUBUNG' : '🔴 DISCONNECT';
+
+    const text = `
+⚡️ *PANSA WORKSPACE DASHBOARD* ⚡️
+━━━━━━━━━━━━━━━━━━━━━━
+📊 *System Status*
+▪️ WhatsApp : ${statusIcon}
+▪️ Batch Size: *${botState.config.batch}* nomor/request
+▪️ Delay API : *${botState.config.delay / 1000}* detik
+
+⚙️ *Panduan:*
+Kirim dokumen \`.txt\` berisi daftar nomor target ke obrolan ini untuk memulai *Bulk Check*.
+━━━━━━━━━━━━━━━━━━━━━━`;
+
+    const keyboard = {
+        inline_keyboard: isRegistered ? [
+            [{ text: '⚙️ Atur Limit & Batch', callback_data: 'menu_settings' }],
+            [{ text: '🔄 Cek Status', callback_data: 'action_check' }, { text: '🛑 Logout', callback_data: 'action_logout' }]
+        ] : [
+            [{ text: '🔑 Login / Pairing WhatsApp', callback_data: 'action_login' }]
+        ]
+    };
+
+    await editOrSendMessage(chatId, messageId, text, keyboard);
+}
+
+// --- TELEGRAM EVENT LISTENERS ---
+console.log('⚡️ Memulai Engine Bot Telegram...');
 if (fs.existsSync('./auth_info_baileys/creds.json')) {
-    console.log('Sesi ditemukan. Menghubungkan ke WhatsApp secara otomatis...');
+    console.log('Sesi ditemukan. Menghubungkan secara otomatis...');
     startWA(); 
 } else {
-    console.log('Menunggu instruksi dari Telegram...');
-    showTelegramMenu(); 
+    sendDashboard(TELEGRAM_CHAT_ID); 
 }
 
-teleBot.onText(/\/(start|menu)/, (msg) => {
+teleBot.onText(/\/(start|menu|dashboard)/, (msg) => {
     if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
-    showTelegramMenu();
+    sendDashboard(msg.chat.id);
 });
 
-teleBot.on('message', (msg) => {
-    if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
+// Listener untuk input nomor HP (State Management)
+teleBot.on('message', async (msg) => {
+    if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID || !msg.text || msg.text.startsWith('/')) return;
     
-    if (msg.reply_to_message && msg.reply_to_message.text.includes("Balas pesan ini dengan nomor WhatsApp")) {
+    if (botState.waitingForInput) {
         const phoneNumber = msg.text.replace(/\D/g, ''); 
-        if (phoneNumber.length < 9 || !phoneNumber.startsWith('62')) {
-            return teleBot.sendMessage(TELEGRAM_CHAT_ID, "❌ *Format nomor salah!* Harus diawali dengan 62 (contoh: 6281234...). Silakan ulangi dengan menekan tombol Login di /menu.");
+        botState.waitingForInput = false;
+
+        // Validasi ketat
+        if (!/^62\d{8,15}$/.test(phoneNumber)) {
+            const errKeyboard = { inline_keyboard: [[{ text: '🔄 Coba Lagi', callback_data: 'action_login' }], [{ text: '🔙 Batal', callback_data: 'nav_dashboard' }]] };
+            return teleBot.sendMessage(msg.chat.id, "❌ *Validasi Gagal!*\nFormat nomor tidak valid. Pastikan diawali dengan 62 tanpa spasi/simbol.", { parse_mode: 'Markdown', reply_markup: errKeyboard });
         }
-        startWA(phoneNumber); 
+
+        const waitMsg = await teleBot.sendMessage(msg.chat.id, "⚙️ _Memproses permintaan login..._", { parse_mode: 'Markdown' });
+        startWA(phoneNumber, msg.chat.id, waitMsg.message_id); 
     }
 });
 
-teleBot.on('callback_query', async (callbackQuery) => {
-    const message = callbackQuery.message;
-    const data = callbackQuery.data;
-
-    if (data === 'action_login_wa') {
-        if (fs.existsSync('./auth_info_baileys/creds.json')) {
-            return teleBot.answerCallbackQuery(callbackQuery.id, { text: 'WhatsApp sudah dalam keadaan login!', show_alert: true });
-        }
-        
-        teleBot.sendMessage(message.chat.id, "📱 *Masukkan Nomor WhatsApp*\n\nBalas pesan ini dengan nomor WhatsApp yang ada di HP Anda untuk disambungkan ke server.\n_(Gunakan format 628xxx tanpa spasi atau tanda plus)_", {
-            parse_mode: 'Markdown',
-            reply_markup: { force_reply: true } 
-        });
-        teleBot.answerCallbackQuery(callbackQuery.id);
-    }
-
-    else if (data.startsWith('start_')) {
-        const [, jobId, mode] = data.split('_');
-        const numbersList = jobQueue.get(jobId);
-
-        if (!numbersList) {
-            return teleBot.answerCallbackQuery(callbackQuery.id, { text: '❌ Sesi file sudah kadaluarsa. Harap upload ulang.', show_alert: true });
-        }
-
-        const config = SPEED_MODES[mode];
-        teleBot.editMessageText(`⏳ *Memulai Proses Bulk Check...*\n⚙️ Mode: *${mode.toUpperCase()}*\n📊 Total: *${numbersList.length}* nomor`, {
-            chat_id: message.chat.id,
-            message_id: message.message_id,
-            parse_mode: 'Markdown'
-        });
-
-        processBulkCheck(numbersList, config, message.chat.id, message.message_id);
-        jobQueue.delete(jobId);
-    }
-});
-
+// Listener Dokumen
 teleBot.on('document', async (msg) => {
     if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
-
     if (!sock?.authState?.creds?.registered) {
-        return teleBot.sendMessage(msg.chat.id, '⚠️ *WhatsApp belum terhubung!* Ketik /menu lalu lakukan login terlebih dahulu.', { parse_mode: 'Markdown' });
+        return teleBot.sendMessage(msg.chat.id, '⚠️ *Akses Ditolak!*\nWhatsApp belum terhubung. Silakan login melalui /dashboard.');
     }
 
-    const fileId = msg.document.file_id;
-    const fileName = msg.document.file_name;
-    
-    if (!fileName.endsWith('.txt')) {
-        return teleBot.sendMessage(msg.chat.id, '❌ Sistem hanya menerima file berekstensi .txt');
+    if (!msg.document.file_name.endsWith('.txt')) {
+        return teleBot.sendMessage(msg.chat.id, '❌ Sistem hanya membaca file ekstens .txt');
     }
 
     try {
-        const fileLink = await teleBot.getFileLink(fileId);
+        const fileLink = await teleBot.getFileLink(msg.document.file_id);
         const response = await fetch(fileLink);
         const textData = await response.text();
 
         let rawNumbers = textData.split('\n').map(n => n.replace(/\D/g, '')).filter(n => n.length > 8);
-        const formattedNumbers = rawNumbers.map(n => {
-            if (n.startsWith('0')) return '62' + n.slice(1);
-            return n;
-        });
-
-        const uniqueNumbers = [...new Set(formattedNumbers)];
+        const uniqueNumbers = [...new Set(rawNumbers.map(n => n.startsWith('0') ? '62' + n.slice(1) : n))];
 
         if (uniqueNumbers.length === 0) {
-            return teleBot.sendMessage(msg.chat.id, '❌ Tidak ada nomor valid yang ditemukan di dalam dokumen.');
+            return teleBot.sendMessage(msg.chat.id, '❌ Tidak ditemukan nomor valid dalam dokumen.');
         }
 
         const jobId = Date.now().toString();
-        jobQueue.set(jobId, uniqueNumbers);
+        botState.jobQueue.set(jobId, uniqueNumbers);
 
+        const text = `📁 *Dokumen Berhasil Dipindai*\n\nTerdeteksi *${uniqueNumbers.length}* nomor unik.\nSistem akan menggunakan konfigurasi Anda saat ini (*${botState.config.batch} batch*).`;
         const keyboard = {
             inline_keyboard: [
-                [{ text: '🚀 Fast (50 nomor / batch)', callback_data: `start_${jobId}_fast` }],
-                [{ text: '🚗 Normal (25 nomor / batch)', callback_data: `start_${jobId}_normal` }],
-                [{ text: '🚲 Slow (10 nomor / batch)', callback_data: `start_${jobId}_slow` }]
+                [{ text: '🚀 Mulai Pengecekan', callback_data: `start_${jobId}` }],
+                [{ text: '⚙️ Ubah Batch', callback_data: 'menu_settings' }, { text: '🔙 Batal', callback_data: 'nav_dashboard' }]
             ]
         };
 
-        teleBot.sendMessage(msg.chat.id, `📁 *Dokumen TXT Diterima!*\nTerdeteksi *${uniqueNumbers.length}* nomor unik.\n\nPilih mode eksekusi pengecekan:`, {
-            parse_mode: 'Markdown',
-            reply_markup: keyboard
-        });
-
+        teleBot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown', reply_markup: keyboard });
     } catch (error) {
-        teleBot.sendMessage(msg.chat.id, `❌ Gagal membaca file: ${error.message}`);
+        teleBot.sendMessage(msg.chat.id, `❌ Gagal memproses file: ${error.message}`);
     }
 });
 
+// Listener Callbacks (Tombol UI)
+teleBot.on('callback_query', async (query) => {
+    const { message, data, id } = query;
+    const chatId = message.chat.id;
+    const msgId = message.message_id;
+
+    switch (true) {
+        case data === 'nav_dashboard':
+            botState.waitingForInput = false;
+            await sendDashboard(chatId, msgId);
+            break;
+
+        case data === 'action_login':
+            if (fs.existsSync('./auth_info_baileys/creds.json')) {
+                return teleBot.answerCallbackQuery(id, { text: 'Akun WhatsApp sudah terhubung!', show_alert: true });
+            }
+            botState.waitingForInput = true;
+            await editOrSendMessage(chatId, msgId, "📱 *Input Nomor WhatsApp*\n\nKirimkan nomor HP yang terpasang di WhatsApp Anda ke obrolan ini.\n\n_Contoh: 6281234567890 (Wajib diawali 62)_", getBackKeyboard());
+            break;
+
+        case data === 'action_check':
+            const status = sock?.authState?.creds?.registered ? "Status: 🟢 Aktif & Terhubung" : "Status: 🔴 Terputus";
+            teleBot.answerCallbackQuery(id, { text: status });
+            break;
+
+        case data === 'action_logout':
+            if (fs.existsSync('./auth_info_baileys')) fs.rmSync('./auth_info_baileys', { recursive: true, force: true });
+            sock = null;
+            teleBot.answerCallbackQuery(id, { text: 'Sesi WhatsApp berhasil dihapus!', show_alert: true });
+            await sendDashboard(chatId, msgId);
+            break;
+
+        case data === 'menu_settings':
+            const setMenuText = `⚙️ *Pengaturan Batch & Delay*\n\nPilih jumlah pengecekan per sesi API. Semakin besar batch, proses makin cepat namun risiko banned makin tinggi.`;
+            const setKeyboard = {
+                inline_keyboard: [
+                    [{ text: '10 Nomor (Aman)', callback_data: 'set_10' }, { text: '25 Nomor (Normal)', callback_data: 'set_25' }],
+                    [{ text: '50 Nomor (Cepat)', callback_data: 'set_50' }, { text: '100 Nomor (Extreme)', callback_data: 'set_100' }],
+                    [{ text: '🔙 Kembali', callback_data: 'nav_dashboard' }]
+                ]
+            };
+            await editOrSendMessage(chatId, msgId, setMenuText, setKeyboard);
+            break;
+
+        case data.startsWith('set_'):
+            const newBatch = parseInt(data.split('_')[1]);
+            botState.config.batch = newBatch;
+            botState.config.delay = newBatch === 10 ? 10000 : newBatch === 25 ? 7000 : newBatch === 50 ? 5000 : 3500;
+            
+            let alertMsg = `✅ Konfigurasi diubah ke Batch ${newBatch}`;
+            let showAlert = false;
+
+            // Warning validation system
+            if (newBatch >= 50) {
+                alertMsg = `⚠️ PERINGATAN RISIKO TINGGI!\n\nBatch ${newBatch} nomor/request memiliki risiko tinggi rate-limit atau banned dari Meta. Gunakan dengan risiko Anda sendiri!`;
+                showAlert = true;
+            }
+
+            await teleBot.answerCallbackQuery(id, { text: alertMsg, show_alert: showAlert });
+            await sendDashboard(chatId, msgId);
+            break;
+
+        case data.startsWith('start_'):
+            const jobId = data.split('_')[1];
+            const numbersList = botState.jobQueue.get(jobId);
+
+            if (!numbersList) {
+                return teleBot.answerCallbackQuery(id, { text: '❌ Sesi file kadaluarsa. Silakan upload ulang.', show_alert: true });
+            }
+
+            await editOrSendMessage(chatId, msgId, `⏳ *Mengeksekusi Mesin Pengecekan...*\n⚙️ Config: *${botState.config.batch} Batch / ${botState.config.delay/1000}s Delay*\n📊 Total Data: *${numbersList.length}* nomor`);
+            processBulkCheck(numbersList, botState.config, chatId, msgId);
+            botState.jobQueue.delete(jobId);
+            break;
+    }
+});
+
+// --- CORE PROCESSING LOGIC ---
 async function processBulkCheck(numbers, config, chatId, msgId) {
     let resultPersonal = "=== DATA NOMOR WA PERSONAL ===\n\n";
     let resultBisnis = "=== DATA NOMOR WA BISNIS ===\n\n";
     let resultTidakTerdaftar = "=== DATA NOMOR TIDAK TERDAFTAR ===\n\n";
     
-    let countPersonal = 0;
-    let countBisnis = 0;
-    let countTidakTerdaftar = 0;
-
+    let countPersonal = 0, countBisnis = 0, countTidakTerdaftar = 0;
     const total = numbers.length;
     let processed = 0;
 
@@ -239,93 +311,58 @@ async function processBulkCheck(numbers, config, chatId, msgId) {
         const batchNumbers = numbers.slice(i, i + config.batch);
         
         const batchPromises = batchNumbers.map(async (num, index) => {
-            // Jitter: Memberi jeda sepersekian detik per request untuk menghindari false-negative dari API Meta
-            await delay(index * 200); 
-            
+            await delay(index * 250); // Jitter delay untuk meminimalisir flag spam
             const jid = `${num}@s.whatsapp.net`;
-            let isRegistered = false;
-            let isBusiness = false;
-            let bio = 'Tidak diketahui / Diprivasi';
-            let bizDesc = 'Tidak ada deskripsi';
-            let bizCategory = 'Tidak diketahui';
-            let dpUrl = 'Tidak ada / Diprivasi';
+            let res = { num, isReg: false, isBiz: false, bio: '-', category: '-', dp: '-' };
 
             try {
                 const [result] = await sock.onWhatsApp(jid);
-                isRegistered = result?.exists || false;
+                res.isReg = result?.exists || false;
 
-                if (isRegistered) {
-                    // Cek Bio Status
+                if (res.isReg) {
+                    try { res.bio = (await sock.fetchStatus(jid))?.status || res.bio; } catch (e) {} 
+                    try { res.dp = await sock.profilePictureUrl(jid, 'image') || res.dp; } catch (e) {}
                     try {
-                        const statusData = await sock.fetchStatus(jid);
-                        bio = statusData?.status || bio;
-                    } catch (e) {} 
-
-                    // Cek Foto Profil URL
-                    try {
-                        dpUrl = await sock.profilePictureUrl(jid, 'image') || dpUrl;
-                    } catch (e) {}
-
-                    // Cek Profil Bisnis
-                    try {
-                        const bizProfile = await sock.getBusinessProfile(jid);
-                        if (bizProfile) {
-                            isBusiness = true;
-                            bizDesc = bizProfile.description || bizDesc;
-                            bizCategory = bizProfile.category || bizCategory;
+                        const biz = await sock.getBusinessProfile(jid);
+                        if (biz) {
+                            res.isBiz = true;
+                            res.category = biz.category || res.category;
                         }
                     } catch (e) {}
                 }
             } catch (error) {}
-
-            return { num, isRegistered, isBusiness, bio, bizDesc, bizCategory, dpUrl };
+            return res;
         });
 
         const batchResults = await Promise.allSettled(batchPromises);
         
-        batchResults.forEach(res => {
-            if (res.status === 'fulfilled') {
-                const { num, isRegistered, isBusiness, bio, bizDesc, bizCategory, dpUrl } = res.value;
-                
-                if (isRegistered) {
-                    if (isBusiness) {
-                        resultBisnis += `Nomor      : ${num}\nBio        : ${bio}\nKategori   : ${bizCategory}\nDeskripsi  : ${bizDesc}\nURL DP     : ${dpUrl}\n----------------------------------------\n`;
+        batchResults.forEach(({ status, value: res }) => {
+            if (status === 'fulfilled') {
+                if (res.isReg) {
+                    if (res.isBiz) {
+                        resultBisnis += `Nomor    : ${res.num}\nBio      : ${res.bio}\nKategori : ${res.category}\n------------------------\n`;
                         countBisnis++;
                     } else {
-                        resultPersonal += `Nomor      : ${num}\nBio        : ${bio}\nURL DP     : ${dpUrl}\n----------------------------------------\n`;
+                        resultPersonal += `Nomor    : ${res.num}\nBio      : ${res.bio}\n------------------------\n`;
                         countPersonal++;
                     }
                 } else {
-                    resultTidakTerdaftar += `${num}\n`;
+                    resultTidakTerdaftar += `${res.num}\n`;
                     countTidakTerdaftar++;
                 }
             }
         });
 
         processed += batchNumbers.length;
+        const progressPercent = Math.round((processed / total) * 100);
 
-        teleBot.editMessageText(`⏳ *Proses Berjalan...*\nProgress: ${processed} / ${total}\n_Menunggu delay ${config.delay/1000} detik untuk batch selanjutnya..._`, {
-            chat_id: chatId,
-            message_id: msgId,
-            parse_mode: 'Markdown'
-        }).catch(() => {}); 
-
+        await editOrSendMessage(chatId, msgId, `⚙️ *Pemindaian Berlangsung...*\n\n⏳ Progress: ${processed}/${total} (*${progressPercent}%*)\n_Jeda pengamanan: ${config.delay/1000} detik_`).catch(() => {});
         if (processed < total) await delay(config.delay);
     }
 
-    teleBot.editMessageText(`✅ *Proses Selesai!*\n\n📊 *Statistik Akhir:*\nTotal Target: ${total}\n\n👤 WA Personal: *${countPersonal}*\n🏢 WA Bisnis: *${countBisnis}*\n❌ Tidak Terdaftar: *${countTidakTerdaftar}*`, {
-        chat_id: chatId,
-        message_id: msgId,
-        parse_mode: 'Markdown'
-    });
+    await editOrSendMessage(chatId, msgId, `✅ *TUGAS SELESAI!*\n\n📊 *Laporan Akhir:*\nTotal Diproses: ${total}\n\n👤 WA Personal: *${countPersonal}*\n🏢 WA Bisnis: *${countBisnis}*\n❌ Tidak Terdaftar: *${countTidakTerdaftar}*`, getBackKeyboard());
 
-    if (countPersonal > 0) {
-        teleBot.sendDocument(chatId, Buffer.from(resultPersonal, 'utf-8'), {}, { filename: `WA_Personal_${Date.now()}.txt`, contentType: 'text/plain' });
-    }
-    if (countBisnis > 0) {
-        teleBot.sendDocument(chatId, Buffer.from(resultBisnis, 'utf-8'), {}, { filename: `WA_Bisnis_${Date.now()}.txt`, contentType: 'text/plain' });
-    }
-    if (countTidakTerdaftar > 0) {
-        teleBot.sendDocument(chatId, Buffer.from(resultTidakTerdaftar, 'utf-8'), {}, { filename: `Tidak_Terdaftar_${Date.now()}.txt`, contentType: 'text/plain' });
-    }
+    if (countPersonal > 0) teleBot.sendDocument(chatId, Buffer.from(resultPersonal, 'utf-8'), {}, { filename: `WA_Personal_${Date.now()}.txt` });
+    if (countBisnis > 0) teleBot.sendDocument(chatId, Buffer.from(resultBisnis, 'utf-8'), {}, { filename: `WA_Bisnis_${Date.now()}.txt` });
+    if (countTidakTerdaftar > 0) teleBot.sendDocument(chatId, Buffer.from(resultTidakTerdaftar, 'utf-8'), {}, { filename: `WA_Mati_${Date.now()}.txt` });
 }
