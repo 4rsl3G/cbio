@@ -1,0 +1,6 @@
+TELEGRAM_BOT_TOKEN=TOKEN_BOT
+TELEGRAM_CHAT_ID=ID
+
+# Konfigurasi Default Kecepatan (Opsional, bisa diatur dinamis via bot)
+DEFAULT_BATCH_SIZE=25
+DEFAULT_DELAY_MS=7000
